@@ -16,9 +16,11 @@ import com.billetera.api.repository.WalletRepository;
 import com.billetera.api.service.TransferService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.util.List;
 
 @Service
 @RequiredArgsConstructor
@@ -29,40 +31,48 @@ public class TransferServiceImpl implements TransferService {
     private final MovementRepository movementRepository;
 
     @Override
-    @Transactional
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public TransactionResponse transfer(TransferRequest request) {
-        // RN-05: Wallet origen diferente a wallet destino
         if (request.getOriginWalletId().equals(request.getDestinationWalletId())) {
             throw new BusinessException("No se pueden realizar transferencias a la misma billetera");
         }
 
-        // 1. Obtención de billeteras de origen y destino
-        Wallet originWallet = walletRepository.findById(request.getOriginWalletId())
+        // 1. Prevenir Deadlocks: Cargar y bloquear las billeteras siguiendo un orden determinista por ID ASC
+        List<Long> walletIds = List.of(request.getOriginWalletId(), request.getDestinationWalletId());
+        List<Wallet> lockedWallets = walletRepository.findAllByIdsWithPessimisticLockOrdered(walletIds);
+
+        if (lockedWallets.size() < 2) {
+            throw new ResourceNotFoundException("Una o ambas billeteras no existen");
+        }
+
+        // Asignar origen y destino desde la lista bloqueada
+        Wallet originWallet = lockedWallets.stream()
+                .filter(w -> w.getId().equals(request.getOriginWalletId()))
+                .findFirst()
                 .orElseThrow(() -> new ResourceNotFoundException("Billetera de origen no encontrada con ID: " + request.getOriginWalletId()));
 
-        Wallet destinationWallet = walletRepository.findById(request.getDestinationWalletId())
+        Wallet destinationWallet = lockedWallets.stream()
+                .filter(w -> w.getId().equals(request.getDestinationWalletId()))
+                .findFirst()
                 .orElseThrow(() -> new ResourceNotFoundException("Billetera de destino no encontrada con ID: " + request.getDestinationWalletId()));
 
-        // RN-04: Billeteras habilitadas
+        // Validaciones de estado
         if (!originWallet.isActive()) {
             throw new BusinessException("La billetera de origen no se encuentra activa");
         }
         if (!destinationWallet.isActive()) {
             throw new BusinessException("La billetera de destino no se encuentra activa");
         }
-
-        // RN-12: Misma moneda
         if (!originWallet.getCurrency().equalsIgnoreCase(destinationWallet.getCurrency())) {
             throw new BusinessException("Las billeteras deben manejar la misma moneda para realizar transferencias");
         }
 
-        // Respaldar saldos anteriores para trazabilidad
         BigDecimal originPreviousBalance = originWallet.getBalance();
         BigDecimal destPreviousBalance = destinationWallet.getBalance();
 
-        // 2. Modificación de Saldos (Lógica de Dominio)
+        // 2. Modificación de Saldos
         try {
-            originWallet.debit(request.getAmount()); // RN-02 y RN-03: Saldo suficiente y no negativo
+            originWallet.debit(request.getAmount());
         } catch (IllegalStateException e) {
             throw new BusinessException(e.getMessage());
         }
@@ -72,7 +82,7 @@ public class TransferServiceImpl implements TransferService {
         walletRepository.save(originWallet);
         walletRepository.save(destinationWallet);
 
-        // 3. Registrar la Transacción Global de Transferencia
+        // 3. Registrar Transacción Global
         Transaction transaction = Transaction.builder()
                 .originWallet(originWallet)
                 .destinationWallet(destinationWallet)
@@ -84,7 +94,7 @@ public class TransferServiceImpl implements TransferService {
                 .build();
         Transaction savedTransaction = transactionRepository.save(transaction);
 
-        // 4. Registrar Movimiento Contable en Origen (Débito - OUT)
+        // 4. Registrar Movimientos
         Movement originMovement = Movement.builder()
                 .wallet(originWallet)
                 .transaction(savedTransaction)
@@ -95,7 +105,6 @@ public class TransferServiceImpl implements TransferService {
                 .build();
         movementRepository.save(originMovement);
 
-        // 5. Registrar Movimiento Contable en Destino (Crédito - IN)
         Movement destinationMovement = Movement.builder()
                 .wallet(destinationWallet)
                 .transaction(savedTransaction)
