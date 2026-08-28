@@ -6,6 +6,9 @@ server:
 spring:
   application:
     name: billetera-digital-api
+  jackson:
+    mapper:
+      SORT_PROPERTIES_ALPHABETICALLY: false
 
   datasource:
     url: jdbc:sqlserver://localhost:1433;databaseName=billeteraDigitalDB;encrypt=true;trustServerCertificate=true;
